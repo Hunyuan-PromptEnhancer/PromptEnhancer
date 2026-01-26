@@ -6,17 +6,24 @@ Supports two modes:
 2. Enhanced prompts from PromptEnhancer
 
 Hunyuan-Image 2.1 uses Adaptive Projected Guidance (APG) + CFG.
+
+Multi-GPU support:
+  # Run on 4 GPUs in parallel
+  for i in {0..3}; do
+    CUDA_VISIBLE_DEVICES=$i python hunyuan_image_generate.py metadata.jsonl \\
+      --gpu-id $i --num-gpus 4 --outdir outputs/hunyuan &
+  done
+  wait
 """
 
 import argparse
 import json
 import os
-from pathlib import Path
 
 import torch
 import numpy as np
 from PIL import Image
-from tqdm import trange
+from tqdm import tqdm, trange
 from einops import rearrange
 from torchvision.utils import make_grid
 from torchvision.transforms import ToTensor
@@ -110,7 +117,7 @@ def parse_args():
         "--batch_size",
         type=int,
         default=1,
-        help="Batch size for generation"
+        help="Batch size for generation (increase if GPU memory allows)"
     )
     parser.add_argument(
         "--skip_grid",
@@ -128,6 +135,19 @@ def parse_args():
         type=int,
         default=None,
         help="End index for partial generation"
+    )
+    # Multi-GPU arguments
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=0,
+        help="GPU ID for this process (0-indexed)"
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Total number of GPUs for parallel generation"
     )
     return parser.parse_args()
 
@@ -163,9 +183,11 @@ def load_prompts(metadata_file: str, enhanced_file: str = None):
         print(f"Loading enhanced prompts from: {enhanced_file}")
         with open(enhanced_file) as fp:
             enhanced_data = [json.loads(line) for line in fp]
+        # Use "index" field from data as key (not enumerate line number)
         enhanced_prompts = {
-            i: item.get("enhanced_prompt", item.get("prompt"))
-            for i, item in enumerate(enhanced_data)
+            item["index"]: item.get("enhanced_prompt", item.get("prompt"))
+            for item in enhanced_data
+            if "index" in item
         }
 
     return metadatas, enhanced_prompts
@@ -240,6 +262,15 @@ def save_outputs(
         grid.save(os.path.join(outpath, "grid.png"))
 
 
+def get_indices_for_gpu(total_count: int, gpu_id: int, num_gpus: int, start_idx: int = 0, end_idx: int = None):
+    """Split indices across GPUs for parallel processing."""
+    if end_idx is None:
+        end_idx = total_count
+    all_indices = list(range(start_idx, end_idx))
+    # Round-robin distribution
+    return [idx for i, idx in enumerate(all_indices) if i % num_gpus == gpu_id]
+
+
 def main():
     args = parse_args()
 
@@ -247,7 +278,7 @@ def main():
         raise RuntimeError("CUDA is required for Hunyuan-Image generation")
 
     device = torch.device("cuda")
-    print(f"Using device: {device}")
+    print(f"[GPU {args.gpu_id}] Using device: {device}")
 
     # Load model
     pipe = load_model(args)
@@ -255,19 +286,26 @@ def main():
     # Load prompts
     metadatas, enhanced_prompts = load_prompts(args.metadata_file, args.enhanced_prompts)
 
-    # Determine range
+    # Determine range with multi-GPU support
     start_idx = args.start_index
     end_idx = args.end_index if args.end_index is not None else len(metadatas)
 
-    print(f"Generating images for prompts {start_idx} to {end_idx - 1}")
-    print(f"Output directory: {args.outdir}")
-    print(f"Using enhanced prompts: {args.enhanced_prompts is not None}")
-    print(f"Using distilled model: {args.use_distilled}")
+    if args.num_gpus > 1:
+        indices = get_indices_for_gpu(len(metadatas), args.gpu_id, args.num_gpus, start_idx, end_idx)
+        print(f"[GPU {args.gpu_id}/{args.num_gpus}] Processing {len(indices)} prompts")
+    else:
+        indices = list(range(start_idx, end_idx))
 
-    for index in trange(start_idx, end_idx, desc="Generating"):
+    print(f"[GPU {args.gpu_id}] Output directory: {args.outdir}")
+    print(f"[GPU {args.gpu_id}] Using enhanced prompts: {args.enhanced_prompts is not None}")
+    print(f"[GPU {args.gpu_id}] Using distilled model: {args.use_distilled}")
+
+    for index in tqdm(indices, desc=f"GPU {args.gpu_id}", position=args.gpu_id):
         metadata = metadatas[index]
-        seed_everything(args.seed)
-        generator = torch.Generator(device=device).manual_seed(args.seed)
+        # Use index-based seed to ensure different prompts have different random states
+        prompt_seed = args.seed + index
+        seed_everything(prompt_seed)
+        generator = torch.Generator(device=device).manual_seed(prompt_seed)
 
         # Determine which prompt to use
         if enhanced_prompts and index in enhanced_prompts:
@@ -279,10 +317,9 @@ def main():
 
         # Skip if already generated
         if os.path.exists(os.path.join(outpath, "metadata.jsonl")):
-            print(f"Skipping {index}: already exists")
             continue
 
-        print(f"Prompt ({index:>3}/{len(metadatas)}): '{prompt}'")
+        print(f"[GPU {args.gpu_id}] Prompt ({index:>3}/{len(metadatas)}): '{prompt[:60]}...'")
 
         # Generate images
         images = generate_images(
@@ -303,7 +340,7 @@ def main():
             skip_grid=args.skip_grid
         )
 
-    print("Done.")
+    print(f"[GPU {args.gpu_id}] Done.")
 
 
 if __name__ == "__main__":
